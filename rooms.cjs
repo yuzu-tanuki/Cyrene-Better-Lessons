@@ -25,7 +25,6 @@ function createRoom(conversationId) {
     boardOwner: null, // 当前 room.board 反映的是哪一层的增量；null = 空板
     lessonFiles: [], // 本节课推过的剧本文件，按推送顺序 —— 回放的播放列表
     lessonPaths: {}, // 文件名 → 绝对路径。只记"用户从文件选择器里挑过"的那些（§14g）
-    lastUserText: "", // Provider 阶段留存，供兜底补剧使用（§6.3）
     updatedAt: Date.now(),
   };
 }
@@ -74,7 +73,6 @@ function makeLayer(input) {
     cursor: 0,
     boardOps: board.projectBoardOps(input.steps),
     transitionHint: input.transitionHint || "",
-    fallback: input.fallback === true,
   };
 }
 
@@ -258,7 +256,6 @@ function advance(room) {
       step,
       stepIndex: layer.cursor - 1,
       file: layer.file,
-      fallback: layer.fallback === true, // 窗口据此显示"兜底补剧"轻标记（§6.3）
       cursor: layer.cursor,
       total: layer.steps.length,
       boardText: board.boardText(room.board),
@@ -276,6 +273,142 @@ function rebuildBoardAt(room, layer) {
   room.board = draft;
   room.boardOwner = layer.id;
   return draft;
+}
+
+// ---------------------------------------------------------------- 持久化（§13）
+
+/** 只保留最近（按 updatedAt）这么多个会话。 */
+const PERSIST_ROOM_LIMIT = 3;
+/** 每个会话最多存这么多层（从队首数），更深的层连同其后的过渡帧一起截掉。 */
+const PERSIST_LAYER_LIMIT = 3;
+
+/**
+ * 一个房间 → 可写进 storage 的纯数据。
+ *
+ * **只存"怎么摆这些剧本"**：帧的文件名 + cursor + 过渡文案（§13）。`steps` 与 `boardOps`
+ * 一律不存——它们只是文件内容的投影，读盘重新解析即可；存下来反而可能与磁盘上的剧本不一致。
+ *
+ * 黑板存**行数组**（而不是让窗口等到第一次点击才重绘）：重开窗口时要立刻看到"回到刚才那块板"。
+ * `lessonPaths` 也一并存：用户从文件选择器挑的剧本在工作区外，不存路径就重读不到它（§14g）。
+ */
+function serializeRoom(room) {
+  const frames = [];
+  let layers = 0;
+  for (const frame of room.frames) {
+    if (frame.type !== "layer") {
+      frames.push({ type: "transition", kind: frame.kind, text: frame.text, title: frame.title || "" });
+      continue;
+    }
+    if (layers >= PERSIST_LAYER_LIMIT) break; // 更深的层连同它后面的过渡帧一起不要
+    layers += 1;
+    frames.push({
+      type: "layer",
+      file: frame.layer.file,
+      cursor: frame.layer.cursor,
+      transitionHint: frame.layer.transitionHint || "",
+    });
+  }
+  return {
+    frames,
+    board: room.board.lines.slice(),
+    lessonFiles: room.lessonFiles.slice(),
+    lessonPaths: Object.assign({}, room.lessonPaths),
+    updatedAt: room.updatedAt,
+  };
+}
+
+/** 全部房间 → storage 形态。没帧、也没推过剧本的空房间不存。 */
+function serializeRooms(limit = PERSIST_ROOM_LIMIT) {
+  const picked = Array.from(rooms.values())
+    .filter((room) => room.frames.length > 0 || room.lessonFiles.length > 0)
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+    .slice(0, limit);
+  const out = {};
+  for (const room of picked) out[room.conversationId] = serializeRoom(room);
+  return out;
+}
+
+/**
+ * 从持久化快照重建房间（§13）。读盘与解析由调用方注入（`resolveLayer`），
+ * 这样 rooms.cjs 不必知道工作区与 BLS。
+ *
+ * @param {object} snapshot storage 里的 rooms
+ * @param {(room: object, entry: object, index: number) => (object|null)} resolveLayer
+ *        按文件造层；读不到就返回 null，该帧丢弃
+ * @returns {{ restored: number, missed: string[] }}
+ */
+function restoreRooms(snapshot, resolveLayer) {
+  const missed = [];
+  let restored = 0;
+  if (!snapshot || typeof snapshot !== "object") return { restored, missed };
+
+  for (const [conversationId, state] of Object.entries(snapshot)) {
+    if (!conversationId || !state || typeof state !== "object") continue;
+
+    const room = createRoom(conversationId);
+    room.lessonFiles = Array.isArray(state.lessonFiles) ? state.lessonFiles.slice() : [];
+    room.lessonPaths =
+      state.lessonPaths && typeof state.lessonPaths === "object" ? Object.assign({}, state.lessonPaths) : {};
+    room.updatedAt = Number(state.updatedAt) || Date.now();
+    if (Array.isArray(state.board)) room.board = { lines: state.board.slice() };
+
+    const lost = [];
+    const frames = Array.isArray(state.frames) ? state.frames : [];
+    frames.forEach((entry, index) => {
+      if (!entry || entry.type === "transition") {
+        room.frames.push(
+          makeTransition(
+            entry && entry.kind === "out" ? "out" : "in",
+            (entry && entry.text) || "",
+            (entry && entry.title) || "",
+          ),
+        );
+        return;
+      }
+      const layer = resolveLayer(room, entry, index);
+      if (!layer) {
+        lost.push(String((entry && entry.file) || `第 ${index + 1} 节`));
+        return;
+      }
+      // cursor 越界（剧本被改短了）时夹回合法范围，别让第一次点击就判"本层结束"
+      const cursor = Number(entry.cursor) || 0;
+      layer.cursor = Math.max(0, Math.min(cursor, layer.steps.length));
+      if (entry.transitionHint) layer.transitionHint = String(entry.transitionHint);
+      room.frames.push({ type: "layer", layer });
+    });
+
+    if (lost.length) {
+      room.restoreNotice = `重开课堂时发现 ${lost.length} 节剧本文件已丢失（${lost.join("、")}），已跳过。`;
+      lost.forEach((name) => missed.push(`${conversationId}/${name}`));
+    }
+
+    // 黑板是不是已经铺成队首那一层：只有"板非空 + 队首是 layer"才认定它已就绪（§8.3）；
+    // 其余情况（板空、队首是过渡帧）置 null，让第一次点击走瞬时重绘，别跳过重绘。
+    const head = room.frames[0];
+    room.boardOwner = head && head.type === "layer" && room.board.lines.length ? head.layer.id : null;
+
+    rooms.set(conversationId, room);
+    restored += 1;
+  }
+  return { restored, missed };
+}
+
+/**
+ * 把一间房间改挂到另一个 conversationId 上。
+ *
+ * 用途见 index.cjs 的 `resolvePushRoom`：模型在某个会话里插话时，若那间会话还没有自己的教室，
+ * 而窗口正看着另一间有内容的教室（最典型是「📂 打开剧本」挑来的 `local` 房间），
+ * 就把现成这间认作该会话的教室，而不是另起一间空的。房间对象本身不动，只换 key。
+ *
+ * **会覆盖目标 key 上原有的房间** —— 调用方必须先确认那边是空房间，否则会吞掉内容。
+ */
+function renameRoom(room, conversationId) {
+  if (!room || !conversationId || room.conversationId === conversationId) return room;
+  rooms.delete(room.conversationId);
+  room.conversationId = conversationId;
+  room.updatedAt = Date.now();
+  rooms.set(conversationId, room);
+  return room;
 }
 
 function clearAll() {
@@ -299,5 +432,9 @@ module.exports = {
   advance,
   rebuildBoardAt,
   enforceFrameBudget,
+  serializeRoom,
+  serializeRooms,
+  restoreRooms,
+  renameRoom,
   clearAll,
 };

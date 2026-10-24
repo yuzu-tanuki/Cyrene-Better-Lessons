@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Better Lessons · 课堂</title>
+  <link rel="stylesheet" href="vendor/katex.min.css" />
   <link rel="stylesheet" href="ui.css" />
 </head>
 <body data-art="fallback">
@@ -46,13 +47,20 @@
     <!-- 舞台：教室背景 / 黑板 / 立绘 / 对话框 四层绝对定位（§11.1）。
          点击舞台任意处推进一帧；选中文字或操作滚动条时不推进。 -->
     <main class="stage" id="stage" aria-label="课堂舞台">
-      <div class="classroom-bg" aria-hidden="true"></div>
+      <div class="classroom-bg" aria-hidden="true">
+        <img class="classroom-img" id="classroomImg" src="assets/classroom-bg.png" alt="">
+      </div>
 
       <section class="board" aria-label="黑板">
         <div class="board-frame" id="boardFrame">
+          <!-- 三层：底图（板面 + 木框） / 板书（markdown） / 边框（压住溢出到框外的字） -->
+          <div class="board-art board-art-body" aria-hidden="true"></div>
           <!-- 板书面布双向可滚动（§8.5）：内容超长时滚动，而不是被裁掉 -->
-          <div class="board-surface" id="boardSurface"></div>
+          <div class="board-surface" id="boardSurface">
+            <div class="board-inner" id="boardInner"></div>
+          </div>
           <div class="board-empty" id="boardEmpty">等待剧本推送…</div>
+          <div class="board-art board-art-boundary" aria-hidden="true"></div>
         </div>
       </section>
 
@@ -88,13 +96,11 @@
       </section>
 
       <div class="notice" id="notice" hidden></div>
-
-      <!-- 兜底补剧的轻标记（§6.3）：这一段不是主模型说的 -->
-      <div class="fallback-badge" id="fallbackBadge" title="这一段由兜底补剧生成" hidden>兜底补剧</div>
     </main>
   </div>
 
   <script src="vendor/markdown-it.min.js"></script>
+  <script src="vendor/katex.min.js"></script>
   <script src="vendor/purify.min.js"></script>
   <script>
     const { ipcRenderer } = require("electron");
@@ -103,8 +109,8 @@
     // ---------------------------------------------------------------- 美术素材
     // 全部素材由插件自带，不读宿主仓库（§9.1）。缺失的素材退回 CSS 程序化占位。
     const ASSETS = {
-      classroom: "assets/classroom-bg.jpg",
-      board: "assets/board.jpg",
+      classroom: "assets/classroom-bg.png",
+      board: "assets/board.png",
       dialog: "assets/dialog-bg.png",
       talk: "assets/cyrene-talk.png",
       write: "assets/cyrene-write.png",
@@ -212,6 +218,175 @@
 
     installLineTagging();
 
+    // ---------------------------------------------------------------- 数学公式（KaTeX）
+    // 板书与对白里的 `$...$`（行内）与 `$$...$$`（独占一段）交给 KaTeX 渲染。
+    //
+    // 为什么不用 KaTeX 的 auto-render：
+    //   1. auto-render 扫的是渲染完的 DOM 文本节点，而 markdown-it 已经先对整个源文本跑过行内规则了
+    //      —— 数学里的 `_`（下标）、`*`（乘法）、`\\`（换行）会被当成 markdown 语法吃掉；
+    //   2. 它必须跑在 DOMPurify **之后**（KaTeX 输出的 MathML 与 inline style 过不了净化白名单），
+    //      而那时也没法再切回"数学源码"的边界了。
+    // 所以这里挂一条 markdown-it 规则：在行内解析之前就把公式源码摘出来，先落成占位元素
+    // （TeX 原文放在文本节点里，顺带避开了净化），等 HTML 插进 DOM 后再用 katex.render 填进去。
+    // 数学源码全程不经过 markdown，也就不需要给 DOMPurify 放行 MathML。
+    const MATH_DELIM = 0x24; // `$`
+    const MATH_BACKSLASH = 0x5c; // `\`
+
+    function isMathSpace(code) {
+      return code === 0x20 || code === 0x09 || code === 0x0a ||
+        code === 0x0b || code === 0x0c || code === 0x0d;
+    }
+
+    /**
+     * 这段文本像不像公式。
+     *
+     * 只为挡住散文里的美元符号（"$5 和 $6"）：含空格却没有任何数学符号的，不当公式。
+     * 数学里常见的形式都能过——`$0 < x < 1$` 有 `<`，`$2x$` 没有空格。
+     */
+    function looksLikeMath(tex) {
+      if (/[\\^_=+\-*/<>{}]/.test(tex)) return true;
+      return !/[ \t]/.test(tex);
+    }
+
+    /** 行内 `$...$` / `$$...$$`（不跨行；跨行的整段公式走 mathBlock）。 */
+    function mathInline(state, silent) {
+      const src = state.src;
+      const start = state.pos;
+      const max = state.posMax;
+      if (src.charCodeAt(start) !== MATH_DELIM) return false;
+
+      const display = src.charCodeAt(start + 1) === MATH_DELIM;
+      const openLen = display ? 2 : 1;
+      const from = start + openLen;
+      // 开分隔符后不能紧跟空白（和 KaTeX auto-render 的约定一致），免得把 "5 美元" 当成公式
+      if (from >= max || isMathSpace(src.charCodeAt(from))) return false;
+
+      let close = -1;
+      for (let i = from; i < max; i += 1) {
+        const code = src.charCodeAt(i);
+        if (code === MATH_BACKSLASH) { i += 1; continue; } // 跳过 \$ 这类转义
+        if (code === 0x0a) return false; // 行内公式不跨行
+        if (code !== MATH_DELIM) continue;
+        if (isMathSpace(src.charCodeAt(i - 1))) continue; // 收尾符前不能是空白
+        if (display) {
+          if (src.charCodeAt(i + 1) === MATH_DELIM) { close = i; break; }
+          continue;
+        }
+        if (src.charCodeAt(i + 1) === MATH_DELIM) { i += 1; continue; } // 单个 $ 不吃 $$
+        if (!looksLikeMath(src.slice(from, i))) continue; // 比如 "$5 和 $6" 里的美元符号
+        close = i;
+        break;
+      }
+      if (close < 0) return false;
+
+      const tex = src.slice(from, close);
+      if (!tex.trim()) return false;
+      if (silent) return true;
+
+      const token = state.push("bl_math_inline", "math", 0);
+      token.content = tex;
+      token.markup = display ? "$$" : "$";
+      token.meta = { display };
+      state.pos = close + openLen;
+      return true;
+    }
+
+    /** 独占一段的 `$$...$$`（可跨多行，直到收尾的 `$$`）。 */
+    function mathBlock(state, startLine, endLine, silent) {
+      const start = state.bMarks[startLine] + state.tShift[startLine];
+      const max = state.eMarks[startLine];
+      if (max - start < 2) return false;
+      if (state.src.charCodeAt(start) !== MATH_DELIM || state.src.charCodeAt(start + 1) !== MATH_DELIM) {
+        return false;
+      }
+
+      // 单行写完的 $$...$$（收尾的 `$$` 之后只允许空白，否则交回段落让行内规则处理）
+      const sameLine = state.src.slice(start + 2, max);
+      const inlineClose = sameLine.indexOf("$$");
+      if (inlineClose >= 0 && !sameLine.slice(inlineClose + 2).trim()) {
+        const tex = sameLine.slice(0, inlineClose);
+        if (!tex.trim()) return false;
+        if (silent) return true;
+        const token = state.push("bl_math_block", "math", 0);
+        token.content = tex;
+        token.map = [startLine, startLine + 1];
+        token.markup = "$$";
+        state.line = startLine + 1;
+        return true;
+      }
+
+      // 多行公式：一直读到含 `$$` 的那一行为止；没闭合就交回普通段落，别把后面的正文整段吞掉
+      const lines = [];
+      if (sameLine.trim()) lines.push(sameLine); // 开分隔符后面紧跟的内容（如 \begin{cases}）不能丢
+      let nextLine = startLine + 1;
+      for (; nextLine < endLine; nextLine += 1) {
+        const from = state.bMarks[nextLine] + state.tShift[nextLine];
+        const to = state.eMarks[nextLine];
+        const text = state.src.slice(from, to);
+        const at = text.indexOf("$$");
+        if (at >= 0 && !text.slice(at + 2).trim()) {
+          lines.push(text.slice(0, at));
+          if (silent) return true;
+          const token = state.push("bl_math_block", "math", 0);
+          token.content = lines.join("\n");
+          token.map = [startLine, nextLine + 1];
+          token.markup = "$$";
+          state.line = nextLine + 1;
+          return true;
+        }
+        lines.push(text);
+      }
+      return false;
+    }
+
+    /** 公式占位：TeX 原文放在文本节点里（净化不会动它），行号标注让动画/滚动能定位到这块。 */
+    function mathPlaceholder(tex, display, lineMap) {
+      const className = display ? "bl-math bl-math-display" : "bl-math";
+      const line = lineMap ? ` data-line="${lineMap}"` : "";
+      return `<span class="${className}" data-math="${display ? "1" : "0"}"${line}>${md.utils.escapeHtml(tex)}</span>`;
+    }
+
+    md.inline.ruler.before("escape", "bl_math_inline", mathInline);
+    md.block.ruler.before("fence", "bl_math_block", mathBlock);
+
+    md.renderer.rules.bl_math_inline = (tokens, idx) => {
+      const token = tokens[idx];
+      return mathPlaceholder(token.content, Boolean(token.meta && token.meta.display), "");
+    };
+
+    md.renderer.rules.bl_math_block = (tokens, idx) => {
+      const token = tokens[idx];
+      const map = token.map ? `${token.map[0]}-${token.map[1]}` : "";
+      return mathPlaceholder(token.content, true, map);
+    };
+
+    /**
+     * 把占位元素换成 KaTeX 渲染结果。必须在 `innerHTML` 之后、量尺寸/滚动之前调用。
+     *
+     * `trust: false` 是关键：它关掉 \href、\htmlClass 这类能往页面里塞任意 HTML/属性的扩展；
+     * `throwOnError: false` 让写错的公式以红色错误形式留在原位，而不是让整块板书消失。
+     */
+    function hydrateMath(root) {
+      if (!root || !window.katex) return;
+      for (const el of root.querySelectorAll("[data-math]")) {
+        const tex = el.textContent || "";
+        const displayMode = el.getAttribute("data-math") === "1";
+        el.removeAttribute("data-math");
+        if (!tex.trim()) continue;
+        try {
+          window.katex.render(tex, el, {
+            displayMode,
+            throwOnError: false,
+            strict: false,
+            trust: false,
+            output: "html",
+          });
+        } catch (err) {
+          el.textContent = tex; // 渲染器自己出了问题也别把公式弄丢
+        }
+      }
+    }
+
     function renderInline(source) {
       return window.DOMPurify.sanitize(
         md.renderInline(String(source == null ? "" : source)),
@@ -230,7 +405,10 @@
 
     const boardFrame = document.getElementById("boardFrame");
     const boardSurface = document.getElementById("boardSurface");
+    const boardInner = document.getElementById("boardInner");
+    const boardArtBody = document.querySelector(".board-art-body");
     const boardEmpty = document.getElementById("boardEmpty");
+    const classroomImg = document.getElementById("classroomImg");
     const dialogText = document.getElementById("dialogText");
     const dialogHint = document.getElementById("dialogHint");
     const figureTalk = document.getElementById("figureTalk");
@@ -240,6 +418,154 @@
     const imgErase = document.getElementById("imgErase");
     const imgEraseSwing = document.getElementById("imgEraseSwing");
     const stageEl = document.getElementById("stage");
+
+    // ---------------------------------------------------------------- 黑板版面
+    /** 素材画布与板面矩形（§11.1）：板面 = 素材里真正能写字的那块区域。 */
+    const BOARD_ART = { w: 1374, h: 1145, hole: { x: 165, y: 250, w: 1045, h: 529 } };
+    const BOARD_TOP = 8;     // 素材距舞台顶的留白
+    const BOARD_LEFT = 0.02; // 素材距舞台左边的比例
+    const BOARD_GUTTER = 16; // 板面被裁时，文字右沿距舞台右边的最小距离
+    const BOARD_LIFT = 75;   // 与 ui.css 的 .board transform: translateY(-75px) 同步
+
+    /**
+     * 黑板版面：素材按舞台高度等比放到最大（宽度由 aspect-ratio 推出来，靠左摆），
+     * 窗口不够宽时右侧被舞台裁掉；板面（文字区）钉在素材的绿色区域上。
+     *
+     * 文字区尺寸必须用 JS 算：左边偏移 = 舞台宽的 2% + 素材内部的百分比，
+     * 而素材宽度是由**舞台高度**推出来的 —— 纯 CSS 里 `left` 的百分比只能按宽度解析。
+     * 板面右边被裁时，文字右沿改为距舞台右边 16px；板面完整时对齐板面右沿。
+     */
+    function layoutBoard() {
+      const withArt = document.body.classList.contains("art-board");
+      if (!withArt) {
+        // 没有素材时退回 CSS 兜底版面，清掉上一次写进去的内联尺寸
+        for (const el of [boardSurface, boardEmpty]) {
+          el.style.left = el.style.top = el.style.width = el.style.height = "";
+        }
+        resetClassroomImg();
+        return;
+      }
+      const W = stageEl.clientWidth;
+      const H = stageEl.clientHeight;
+      const artH = H - BOARD_TOP * 2;
+      const artW = artH * (BOARD_ART.w / BOARD_ART.h);
+      const s = artH / BOARD_ART.h;
+      const gx = W * BOARD_LEFT + BOARD_ART.hole.x * s;
+      const gy = BOARD_TOP + BOARD_ART.hole.y * s;
+      const gw = BOARD_ART.hole.w * s;
+      const gh = BOARD_ART.hole.h * s;
+      const right = Math.min(gx + gw, W - BOARD_GUTTER);
+      for (const el of [boardSurface, boardEmpty]) {
+        el.style.left = gx + "px";
+        el.style.top = gy + "px";
+        el.style.width = Math.max(80, right - gx) + "px";
+        el.style.height = gh + "px";
+      }
+
+      // 教室背景：保持原比例，顶端对齐黑板素材顶端、底端贴舞台底、中轴对齐黑板素材中轴
+      if (document.body.classList.contains("art-classroom") && classroomImg.naturalWidth > 0) {
+        const artTop = BOARD_TOP - BOARD_LIFT;
+        const artCenterX = W * BOARD_LEFT + artW / 2;
+        const bgH = H - artTop;
+        const bgW = bgH * (classroomImg.naturalWidth / classroomImg.naturalHeight);
+        classroomImg.style.left = (artCenterX - bgW / 2) + "px";
+        classroomImg.style.top = artTop + "px";
+        classroomImg.style.width = bgW + "px";
+        classroomImg.style.height = bgH + "px";
+      } else {
+        resetClassroomImg();
+      }
+    }
+
+    /** 素材缺失时让 CSS 的 cover 兜底接管 */
+    function resetClassroomImg() {
+      classroomImg.style.left = classroomImg.style.top = "";
+      classroomImg.style.width = classroomImg.style.height = "";
+    }
+
+    classroomImg.addEventListener("load", layoutBoard);
+
+    window.addEventListener("resize", layoutBoard);
+
+    // ---------------------------------------------------------------- 板书回弹
+    // iOS 原生列表那种"到边界还能再拉一点、松手弹回去"的手感。
+    // 只平移内容层（boardInner），滚动容器本身不动 —— 否则滚动条和裁剪区会跟着跑。
+    const BOUNCE_MAX = 48;         // 最多拉出多少像素（比上一版更收敛）
+    const BOUNCE_RELEASE_MS = 220; // 松手判定：滚轮停这么久才开始回弹（触控板惯性尾巴不会被半路截断）
+    const BOUNCE_RETURN_MS = 560;  // 回弹时长（更长、更缓，避免"弹一下"的抽动感）
+    let boardBounce = 0;
+    let boardBounceTimer = null;
+    let boardBounceReturning = false;
+
+    function applyBounce(px, animate) {
+      boardBounce = px;
+      boardInner.style.transition = animate
+        ? `transform ${BOUNCE_RETURN_MS}ms cubic-bezier(.22, .68, .24, 1)`
+        : "none";
+      boardInner.style.transform = px ? `translateY(${px}px)` : "";
+    }
+
+    /** 回到原位；animate=false 用于换帧重绘（不能带着位移画新内容）。 */
+    function resetBounce(animate) {
+      if (boardBounceTimer) {
+        clearTimeout(boardBounceTimer);
+        boardBounceTimer = null;
+      }
+      boardBounceReturning = false;
+      applyBounce(0, animate === true);
+    }
+
+    /** 回弹动画进行中又被滚轮接管时，从当前实际位移接着拉，避免跳一下（"抽搐"的来源）。 */
+    function currentBounceY() {
+      const t = getComputedStyle(boardInner).transform;
+      if (!t || t === "none") return 0;
+      const m = t.match(/matrix\(([^)]+)\)/);
+      if (!m) return 0;
+      const parts = m[1].split(",");
+      return Number(parts[5]) || 0;
+    }
+
+    function releaseBounce() {
+      if (!boardBounce) return;
+      boardBounceReturning = true;
+      applyBounce(0, true);
+    }
+
+    boardInner.addEventListener("transitionend", (event) => {
+      if (event.propertyName === "transform") boardBounceReturning = false;
+    });
+
+    boardSurface.addEventListener("wheel", (event) => {
+      const max = boardSurface.scrollHeight - boardSurface.clientHeight;
+      const atTop = boardSurface.scrollTop <= 0;
+      const atBottom = boardSurface.scrollTop >= max - 1;
+      const outward = (event.deltaY < 0 && atTop) || (event.deltaY > 0 && atBottom);
+      if (!outward) {
+        if (boardBounce) resetBounce(true); // 反向滚动：先把拉伸收回去
+        return;
+      }
+      event.preventDefault();
+      if (boardBounceReturning) {
+        boardBounce = currentBounceY();
+        boardBounceReturning = false;
+      }
+      // 阻尼更重：滚轮像素先按模式归一化，再乘阻力；单次事件最多推 18px，
+      // 避免一格滚轮就把内容甩出去（"抽搐"的主要来源）
+      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? boardSurface.clientHeight : 1;
+      const delta = event.deltaY * unit;
+      const resist = 0.26 - 0.12 * Math.min(1, Math.abs(boardBounce) / BOUNCE_MAX);
+      const step = Math.sign(delta) * Math.min(Math.abs(delta) * resist, 18);
+      const next = boardBounce - step;
+      applyBounce(Math.max(-BOUNCE_MAX, Math.min(BOUNCE_MAX, next)), false);
+      if (boardBounceTimer) clearTimeout(boardBounceTimer);
+      boardBounceTimer = setTimeout(() => {
+        boardBounceTimer = null;
+        releaseBounce();
+      }, BOUNCE_RELEASE_MS);
+    }, { passive: false });
+
+    boardSurface.addEventListener("pointerup", () => resetBounce(true));
+    window.addEventListener("blur", () => resetBounce(true));
 
     /** 差分交替间隔（§9.3）：擦板是一个动作，两帧交替才读得出"在擦"。 */
     const SWING_MS = 380;
@@ -400,7 +726,9 @@
       boardLines = body.split("\n");
       boardSource = body;
 
-      boardSurface.innerHTML = renderBoardHtml(body);
+      resetBounce(false); // 换帧时不能带着拉伸位移铺新内容
+      boardInner.innerHTML = renderBoardHtml(body);
+      hydrateMath(boardInner); // 公式要在量尺寸 / 滚动之前渲染好，否则定位会按裸文本算
 
       refreshBoardEmpty();
       if (hint) animateBoard(hint);
@@ -452,14 +780,20 @@
       }
     }
 
-    /** 把元素带到指定位置（§8.5）。block 就是"要它停在哪"：nearest 贴最近边，start 贴视野顶部。 */
-    function scrollIntoViewIfNeeded(el, block) {
-      if (!el || typeof el.scrollIntoView !== "function") return;
-      try {
-        el.scrollIntoView({ block: block || "nearest", inline: "nearest" });
-      } catch (err) {
-        /* 老实现不支持参数对象时忽略；不影响播放 */
-      }
+    /**
+     * 把板书里的某个元素带到**黑板视野**顶部（§8.5）。
+     *
+     * 绝不能调 `element.scrollIntoView()`：它会把**所有**可滚动祖先一起滚，而 `overflow: hidden`
+     * 的元素照样算滚动容器 —— 于是 `.stage` / `.page` 被滚走，背景、黑板、对话框、立绘槽整体上移
+     * （2026-10-24 实测：board replace 一步让 `.stage.scrollTop` 变成 62px；之后立绘跳动改变溢出
+     * 高度，又把整张舞台拽回来一点，形成"立绘向上、其余向下"的反复抖动）。
+     * 这里只改 boardSurface 自己的 scrollTop，别的层一概不动。
+     */
+    function scrollElementToBoardTop(el) {
+      if (!el) return;
+      const delta =
+        el.getBoundingClientRect().top - boardSurface.getBoundingClientRect().top;
+      if (delta) boardSurface.scrollTop += delta;
     }
 
     /**
@@ -480,10 +814,12 @@
     /** hint：{ kind: "block", fromLine } | { kind: "replace", line } | { kind: "clear" } */
     function animateBoard(hint) {
       if (hint.kind === "clear") {
-        boardFrame.classList.remove("bl-cleared");
-        void boardFrame.offsetWidth;
-        boardFrame.classList.add("bl-cleared");
-        setTimeout(() => boardFrame.classList.remove("bl-cleared"), 420);
+        // 只闪底层的黑板素材；顶层边框（皇冠 / 飘带）不跟着闪
+        const flashEl = document.body.classList.contains("art-board") ? boardArtBody : boardFrame;
+        flashEl.classList.remove("bl-cleared");
+        void flashEl.offsetWidth;
+        flashEl.classList.add("bl-cleared");
+        setTimeout(() => flashEl.classList.remove("bl-cleared"), 420);
         return;
       }
 
@@ -505,7 +841,7 @@
         const el = findLineElement(hint.line);
         if (el) {
           markElements([el], "bl-flash", false);
-          scrollIntoViewIfNeeded(el, "start");
+          scrollElementToBoardTop(el);
         }
       }
     }
@@ -519,6 +855,7 @@
 
     function setDialog(text) {
       dialogText.innerHTML = renderInline(text);
+      hydrateMath(dialogText);
       dialogText.scrollTop = 0;
     }
 
@@ -535,12 +872,6 @@
 
     function setHint(text) {
       dialogHint.textContent = text;
-    }
-
-    /** 兜底补剧的轻标记（§6.3）：跟着**当前这一层**走。 */
-    function setFallbackBadge(on) {
-      const el = document.getElementById("fallbackBadge");
-      if (el) el.hidden = !on;
     }
 
     // ---------------------------------------------------------------- 推进
@@ -560,7 +891,6 @@
         // 否则课后每点一次她都会弹一下。想看一遍请用「⟲ 本节」。
         playFigure({ slot: "talk" }, { bounce: false });
         setHint("【完】");
-        setFallbackBadge(false);
         return;
       }
 
@@ -570,7 +900,6 @@
 
       if (result.kind === "transition") {
         // 过渡帧本身就是在清板（§9.2），所以立绘演一次"擦板"。
-        // 过渡帧不属于任何一层，标记保持原样，等下一步再判。
         renderBoard(result.boardText, { kind: "clear" });
         setDialog(result.transition.text || "");
         playFigure({ slot: "board", art: "erase" });
@@ -582,7 +911,6 @@
       const total = result.total;
       const base = `第 ${result.cursor}/${total} 步`;
       if (result.file) currentFile = result.file;
-      setFallbackBadge(result.fallback === true);
       // 立绘演出与黑板渲染同时开始：她走过去的同时板书就在写。
       // 跳动只由真正的 say step 触发（§9.3）—— 未知类型不跳，避免"点了没反应"变成"乱弹"。
       playFigure(stageOf(step), { bounce: step.kind === "say" });
@@ -673,8 +1001,6 @@
         // 第一次点击才会演出对应 step 的动作。
         playFigure({ slot: "talk" }, { instant: true });
         setHint("▽");
-        // 队列已换成新的，标记跟着队首那一层走（第一步点击时还会再确认一次）
-        setFallbackBadge(res.fallback === true);
         showNotice(text);
       } catch (err) {
         showNotice(String(err && err.message ? err.message : err));
@@ -724,11 +1050,11 @@
     });
 
     ipcRenderer.on(CH("restore"), (_event, payload) => {
-      // 跨会话切换绑定时主进程会把那个房间已有的现场发过来；帧队列本来就在主进程里，不用还原。
-      // TODO(P1): 持久化恢复（§13）还要把 cursor 一起对回去。
+      // 打开窗口 / 跨会话切绑定时，主进程把那个房间已有的现场发过来（§13）：帧队列在主进程里，
+      // 窗口这边只把板书铺回去。文案也由主进程给（切会话，或"上次恢复时丢过节"）。
       leaveIdle();
       if (payload && typeof payload.board === "string") renderBoard(payload.board, null);
-      showNotice("已切换到这个会话的课堂");
+      if (payload && payload.notice) showNotice(payload.notice);
     });
 
     ipcRenderer.on(CH("notice"), (_event, payload) => {
@@ -754,9 +1080,12 @@
     window.__bl = { renderBoard, setDialog, playFigure, stageOf, showNotice, applyFrame };
 
     detectArt().finally(async () => {
+      layoutBoard(); // 素材探完后才知道走素材版面还是兜底版面
       primeFigures();
       playFigure({ slot: "talk" }, { instant: true }); // 开场不演三拍、也不跳
-      renderBoard("");
+      // 主进程可能已经先把"上次的板书"推过来了（§13 的 restore 抢在这段异步初始化之前），
+      // 那时板上有东西，就别拿这块空板把它盖掉。
+      if (!boardSource.trim()) renderBoard("");
       setDialog("点「📂 打开剧本」挑一个剧本，或者等昔涟推给你。");
       setHint("▽");
       try {

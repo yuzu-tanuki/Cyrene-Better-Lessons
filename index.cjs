@@ -9,9 +9,9 @@
  *           · 窗口侧的帧播放、行级动画与滚动落点（§8.2 / §8.5）、三姿态立绘（§9.2）
  *           · write_lesson / push_script / lesson_list / status / close
  *           · 工具注册与 schema（§5.1 / §5.2）、Provider 注入（§6.2）
- *           · 轮次稽核与兜底补剧（§6.3）、回放三入口（§14）
- *   待办    · 美术素材（§9.1；缺素材时走 CSS 程序化占位，功能不受影响）
- *           · 持久化（§13）
+ *           · 轮次稽核：模型写了剧本却没推时替它推出去（§6.3）、回放三入口（§14）
+ *           · 持久化：rooms + prefs 去抖落盘，启动时重建房间与窗口现场（§13）
+ *           · 美术素材（§9.1；缺素材时走 CSS 程序化占位，功能不受影响）
  *
  * 约定：
  *   · 工具 execute 一律返回字符串，不抛异常 —— 主聊天路径不做参数校验（§5.3 第 2 条），
@@ -31,7 +31,7 @@ const PLUGIN_ID = "better-lessons";
 const CH = (name) => `plugin:${PLUGIN_ID}:${name}`;
 
 // 所有给模型的措辞都在 prompts.cjs（含各自【调用时机】注释）；这里只负责"什么时候送出去"。
-const { BLS_FORMAT_SPEC, SAMPLE_SCRIPT, buildClassroomBrief, buildFallbackRequest } = prompts;
+const { BLS_FORMAT_SPEC, SAMPLE_SCRIPT, buildClassroomBrief } = prompts;
 
 /** 每个会话一个 Room 由 rooms 管理；窗口只有一个，绑定到最近一次推送的会话（§11.1）。 */
 let pluginWin = null;
@@ -46,25 +46,173 @@ const LOCAL_ROOM_ID = "local";
 /** 跨次选择记住的位置，用于文件选择器的默认目录。 */
 const remember = { lastPickedDir: "" };
 
+// ---------------------------------------------------------------- 持久化（§13）
+
+/** storage key 必须匹配 ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$。 */
+const STORAGE_ROOMS = "rooms";
+const STORAGE_PREFS = "prefs";
+/** 写入去抖：窗口每点一下就落盘会造成明显 IO 抖动（§13）。 */
+const PERSIST_DEBOUNCE_MS = 1200;
+
+/**
+ * 跨次启动记住的偏好：窗口尺寸/位置、是否自动开窗、上次绑定的会话。
+ *
+ * `boundConversationId` 是 §13 表里没写、但"关窗重开后恢复现场"必须的一项：
+ * 不记它，重开时不知道该把窗口绑回哪个房间（登记了多个会话时尤其明显）。
+ */
+let prefs = { autoOpen: true, boundConversationId: "", windowBounds: null };
+let persistTimer = null;
+
+/** 落盘去抖。状态一变就调它，别直接写盘。 */
+function schedulePersist() {
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    persistNow();
+  }, PERSIST_DEBOUNCE_MS);
+}
+
+/** 真正落盘。`storage.set` 是同步原子写（先写 .tmp 再 rename），不会写坏 JSON。 */
+function persistNow() {
+  const storage = ctxRef && ctxRef.storage;
+  if (!storage) return;
+  try {
+    storage.set(STORAGE_ROOMS, rooms.serializeRooms());
+  } catch (err) {
+    ctxRef.log(`持久化 rooms 失败：${err && err.message ? err.message : err}`);
+  }
+  try {
+    prefs.boundConversationId = boundConversationId || "";
+    storage.set(STORAGE_PREFS, prefs);
+  } catch (err) {
+    ctxRef.log(`持久化 prefs 失败：${err && err.message ? err.message : err}`);
+  }
+}
+
+/** 立刻落盘：窗口关闭、插件停用前调它，别把去抖里还没写完的改动丢了。 */
+function flushPersist() {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  captureBounds();
+  persistNow();
+}
+
+/** 存的窗口矩形要过一遍合法性检查：换分辨率、拔显示器都可能让它不再可用。 */
+function normalizeBounds(bounds) {
+  if (!bounds || typeof bounds !== "object") return null;
+  const x = Number(bounds.x);
+  const y = Number(bounds.y);
+  const width = Number(bounds.width);
+  const height = Number(bounds.height);
+  if (![x, y, width, height].every(Number.isFinite)) return null;
+  if (width < 640 || height < 520) return null; // 比 minWidth / minHeight 还小的记录直接丢掉
+  return {
+    x: Math.round(x),
+    y: Math.round(y),
+    width: Math.round(width),
+    height: Math.round(height),
+    maximized: bounds.maximized === true,
+  };
+}
+
+function loadPrefs() {
+  const saved = ctxRef && ctxRef.storage ? ctxRef.storage.get(STORAGE_PREFS) : null;
+  if (!saved || typeof saved !== "object") return;
+  prefs = {
+    // 只有显式存成 false 才算关掉自动开窗；缺字段一律按"开"（与没有这份存档时的行为一致）
+    autoOpen: saved.autoOpen !== false,
+    boundConversationId: typeof saved.boundConversationId === "string" ? saved.boundConversationId : "",
+    windowBounds: normalizeBounds(saved.windowBounds),
+  };
+}
+
+/** 窗口被拖动 / 缩放 / 关闭时记下矩形。最大化时用 getNormalBounds 保留"还原后"的尺寸。 */
+function captureBounds() {
+  if (!pluginWin || pluginWin.isDestroyed()) return;
+  const b = pluginWin.getNormalBounds();
+  prefs.windowBounds = {
+    x: b.x,
+    y: b.y,
+    width: b.width,
+    height: b.height,
+    maximized: pluginWin.isMaximized(),
+  };
+}
+
+/**
+ * 窗口打开时把绑定房间的现场推回去（§13）：板书立刻铺出来、帧数告诉窗口。
+ *
+ * **只在队列里还有没播完的帧时才发**：没有帧就该老实停在开场态（§8.6 的判据只认 frames）。
+ */
+function pushRestore(notice) {
+  const conversationId = boundConversationId;
+  if (!conversationId) return;
+  const room = rooms.getRoom(conversationId);
+  if (!room) return;
+  sendToWindow(CH("bind"), { conversationId });
+  if (!room.frames.length) return;
+  sendToWindow(CH("restore"), {
+    conversationId,
+    frames: room.frames.length,
+    board: board.boardText(room.board),
+    notice: notice || room.restoreNotice || "",
+  });
+}
+
+/** 启动时把 storage 里的房间重建回来（§13）。读盘是异步的，所以 register 得等它。 */
+async function restorePersisted() {
+  const storage = ctxRef && ctxRef.storage;
+  if (!storage) return;
+  loadPrefs();
+  if (prefs.boundConversationId) boundConversationId = prefs.boundConversationId;
+
+  const snapshot = storage.get(STORAGE_ROOMS);
+  if (!snapshot || typeof snapshot !== "object") return;
+
+  // 先把每个会话的工作区根取出来（异步），再交给纯同步的 restoreRooms
+  const roots = new Map();
+  for (const conversationId of Object.keys(snapshot)) {
+    try {
+      roots.set(conversationId, await workspaceRootOf(null, conversationId));
+    } catch (err) {
+      roots.set(conversationId, null); // 拿不到根也不放弃：挑来的剧本靠 lessonPaths 照样读得出（§14g）
+    }
+  }
+
+  const summary = rooms.restoreRooms(snapshot, (room, entry, index) => {
+    const built = buildLayerByName(room, roots.get(room.conversationId) || null, entry.file, {
+      index,
+      transitionHint: entry.transitionHint,
+    });
+    return built.ok ? built.layer : null;
+  });
+  ctxRef.log(
+    `持久化恢复：重建 ${summary.restored} 个课堂` +
+      (summary.missed.length ? `，${summary.missed.length} 节剧本文件已丢失` : ""),
+  );
+}
+
 // ---------------------------------------------------------------- 轮次稽核（§6.3）
 
 /**
  * runId → 本轮课堂相关的动作。
  *
  * 事件是旁路通知（宿主不等待监听器，单个超 5 秒会被记录），所以监听器里只做**同步记账**，
- * 真正的兜底动作留到 turn:finished —— 那时才知道"这一轮结束了、最后还是没人推剧本"。
+ * 真正的动作留到 turn:finished —— 那时才知道"这一轮结束了、写下的稿子最后还是没推"。
+ *
+ * 只记两件事：本轮是否**成功推过**（`pushed`）、是否**写过剧本文件**（`wroteFile`）。
+ * 要不要动用课堂由模型自己决定，所以这里不记"它有没有碰课堂"——没写就什么都不做。
  */
 const runs = new Map();
 /** 记账表上限：turn:finished 万一丢了，也不要让它无限增长。 */
 const MAX_RUNS = 20;
-/** 兜底补剧的冷却：连续几轮都不接课堂时，别每轮都补一段。 */
-const FALLBACK_COOLDOWN_MS = 30_000;
-const fallbackAt = new Map();
 
 function auditEntry(runId) {
   let entry = runs.get(runId);
   if (!entry) {
-    entry = { conversationId: "", mode: "", classroomToolUsed: false, pushed: false, wroteFile: "" };
+    entry = { conversationId: "", mode: "", pushed: false, wroteFile: "" };
     runs.set(runId, entry);
     while (runs.size > MAX_RUNS) runs.delete(runs.keys().next().value);
   }
@@ -73,7 +221,6 @@ function auditEntry(runId) {
 
 function clearAudit() {
   runs.clear();
-  fallbackAt.clear();
 }
 
 // ---------------------------------------------------------------- 工作区与窗口
@@ -85,7 +232,7 @@ async function workspaceRootOf(toolCtx, conversationId) {
   return binding ? binding.root : null;
 }
 
-/** 半屏无边框窗口（§11.1）。已存在则聚焦。 */
+/** 半屏无边框窗口（§11.1）。已存在则聚焦。上次手动改过的尺寸/位置记在 prefs 里（§13）。 */
 async function openWindow() {
   if (pluginWin && !pluginWin.isDestroyed()) {
     pluginWin.focus();
@@ -93,11 +240,24 @@ async function openWindow() {
   }
 
   const { workArea } = screen.getPrimaryDisplay(); // 已排除任务栏
+  const saved = prefs.windowBounds;
+  // 默认左半屏；有存档就沿用，但要夹回当前工作区（换了分辨率 / 拔了显示器照样能用）
+  const bounds = saved
+    ? {
+        x: Math.min(Math.max(saved.x, workArea.x), workArea.x + Math.max(0, workArea.width - 200)),
+        y: Math.min(Math.max(saved.y, workArea.y), workArea.y + Math.max(0, workArea.height - 200)),
+        width: Math.min(Math.max(saved.width, 640), workArea.width),
+        height: Math.min(Math.max(saved.height, 520), workArea.height),
+      }
+    : {
+        x: workArea.x,
+        y: workArea.y,
+        width: Math.round(workArea.width / 2), // 左半屏
+        height: workArea.height,
+      };
+
   const win = new BrowserWindow({
-    x: workArea.x,
-    y: workArea.y,
-    width: Math.round(workArea.width / 2), // 左半屏
-    height: workArea.height,
+    ...bounds,
     minWidth: 640,
     minHeight: 520,
     frame: false,
@@ -111,10 +271,25 @@ async function openWindow() {
     webPreferences: { nodeIntegration: true, contextIsolation: false },
   });
   pluginWin = win;
+  if (saved && saved.maximized) win.maximize();
+  // 拖动 / 缩放 / 关闭各记一次矩形（去抖），下次沿用
+  const rememberBounds = () => {
+    captureBounds();
+    schedulePersist();
+  };
+  win.on("resize", rememberBounds);
+  win.on("move", rememberBounds);
+  win.on("close", () => {
+    captureBounds();
+    persistNow();
+  });
   win.on("closed", () => {
     if (pluginWin === win) pluginWin = null;
   });
   await win.loadFile(path.join(__dirname, "ui.html"));
+  // 窗口自己的开场渲染跑在 detectArt() 之后（异步），这里发的 restore 可能先到；
+  // 窗口侧对"还没渲染过内容"做了保护，不会被那一下空板盖掉（见 ui.html 的 boardSource 判断）。
+  pushRestore();
   return win;
 }
 
@@ -131,7 +306,7 @@ function sendToWindow(channel, payload) {
 }
 
 /**
- * 把一层交给窗口（§5.3 第 1 条）。模型推送、补推、兜底补剧三条路径共用。
+ * 把一层交给窗口（§5.3 第 1 条）。模型推送与稽核补推两条路径共用。
  *
  * 入队之后**同步**发送，中间不要再 await 任何东西 —— 宿主 abort 旧 run 时若卡在 await 上，
  * 就会出现"剧本推了一半"的撕裂状态。窗口没开就先开。
@@ -142,13 +317,19 @@ function deliverLayer(room, layer, conversationId, options) {
   // 并把那个房间已有的现场还原回去，否则窗口会一边演新房间的步、一边留着上个房间的板书。
   const switching = Boolean(boundConversationId) && boundConversationId !== conversationId;
   boundConversationId = conversationId;
+  schedulePersist(); // 绑定换了，下次启动要能回到同一个房间（§13）
 
   const deliver = () => {
     sendToWindow(CH("bind"), { conversationId });
-    if (switching) {
+    // 教室"改挂"到本会话（resolvePushRoom）时不发 restore：板还是同一块板，只是换了归属，
+    // 弹一句"已切换到这个会话的课堂"会把人看糊涂。
+    if (switching && !opts.adopted) {
       sendToWindow(CH("restore"), {
-        board: board.boardText(room.board),
+        conversationId,
         frames: room.frames.length,
+        board: board.boardText(room.board),
+        // 这个房间上次恢复时若丢过节，优先把那件事说清楚，而不是笼统的"已切换"
+        notice: room.restoreNotice || "已切换到这个会话的课堂",
       });
     }
     if (opts.dropped > 0) {
@@ -162,7 +343,37 @@ function deliverLayer(room, layer, conversationId, options) {
   };
 
   if (pluginWin && !pluginWin.isDestroyed()) deliver();
-  else openWindow().then(deliver).catch(() => {});
+  // prefs.autoOpen 关掉时不再"推了就把窗口拉起来"：这一层照样进队列，用户自己开窗就能看
+  else if (prefs.autoOpen !== false) openWindow().then(deliver).catch(() => {});
+}
+
+/**
+ * 这一层该推给哪间教室（§11.1）。
+ *
+ * 教室按 `conversationId` 分；但**一间空教室没有任何意义**。模型在某个会话里插话时，若那间会话
+ * 还没有自己的教室（没帧、也没推过剧本），而窗口正看着另一间有内容的教室（最典型的是「📂 打开剧本」
+ * 挑来的 `local` 房间），就把现成那间**改挂到该会话名下**，而不是另起一间空的 —— 否则插话自成一层，
+ * 演完没有上一层可回（实测踩过）。
+ *
+ * 只在**窗口开着**时才做这件事：窗口没开就没有"正看着的那间"，回到按会话取/建的老规矩。
+ *
+ * **不改挂，只挑房间**：真正的 `renameRoom` 留给调用方在"剧本确实读出来了"之后做——
+ * 读失败时不该留下房间换了 key 的副作用（那样窗口还按旧 key 找房间，会点不动）。
+ *
+ * @returns {{ room: object, adoptInto?: string }}
+ */
+function resolvePushRoom(conversationId) {
+  const target = rooms.getRoom(conversationId);
+  const targetEmpty = !target || (!target.frames.length && !target.lessonFiles.length);
+  if (!targetEmpty) return { room: target };
+
+  const windowOpen = Boolean(pluginWin && !pluginWin.isDestroyed());
+  const watched = windowOpen && boundConversationId ? rooms.getRoom(boundConversationId) : null;
+  if (watched && watched.conversationId !== conversationId && (watched.frames.length || watched.lessonFiles.length)) {
+    return { room: watched, adoptInto: conversationId };
+  }
+
+  return { room: target || rooms.ensureRoom(conversationId) };
 }
 
 /** 文件选择器的默认目录：优先工作区的 learn/lessons/，其次上次挑过的位置（§14g）。 */
@@ -240,7 +451,6 @@ function buildLayerFromSource(conversationId, name, source, extras) {
     title: parsed.title || bls.deriveTitle(parsed.steps, ""),
     steps: parsed.steps,
     transitionHint: opts.transitionHint || "",
-    fallback: opts.fallback === true,
   });
   return { ok: true, layer, parsed };
 }
@@ -298,7 +508,7 @@ const writeLessonTool = {
   name: "写课堂剧本文件",
   description:
     "把一段讲解写成 BLS 剧本并保存到工作区的 learn/lessons/ 目录。同名文件会被覆盖。" +
-    "写完必须紧接着调用 better-lessons_push_script 推送，否则课堂上不会看到任何东西。" +
+    "想让它在黑板上演出来，写完紧接着调用 better-lessons_push_script 推送；只写不推，课堂上看不到任何东西。" +
     "格式见 system context 的《BLS 剧本格式》。",
   enabled: true,
   // 刻意不声明 risk：宿主 obsidian_edit 同为"向 Vault 写文件"却不声明 risk（默认 safe、免审批），
@@ -363,8 +573,8 @@ const pushScriptTool = {
   id: "better-lessons_push_script",
   name: "推送课堂剧本",
   description:
-    "按文件名读取 learn/lessons/ 下的剧本，推送到黑板窗口演出。" +
-    "当课堂窗口已开启且用户插话时，必须走「write_lesson 写剧本 + push_script 推送」，不要在聊天框里只回文本。",
+    "按文件名读取 learn/lessons/ 下的剧本，推送到黑板窗口演出（默认打断当前播放）。" +
+    "课堂开着时想把新内容演出来、或重演某一节，用它；也可以完全不调用它，只在聊天框里回答。",
   enabled: true,
   risk: "safe",
   effectKind: "mutation",
@@ -392,18 +602,26 @@ const pushScriptTool = {
     if (!root) return "该会话未绑定工作区，无法读取剧本文件。请确认当前会话处于 learn 模式且已绑定工作区。";
     if (!file) return `缺少参数 file。当前可用剧本：${availableLessons(root)}`;
 
-    const room = rooms.ensureRoom(conversationId);
-    const built = buildLayerByName(room, root, file, {
+    // 教室按会话分，但空教室没有意义：本会话还没有教室时，认下窗口正看着的那间（§11.1）
+    const pick = resolvePushRoom(conversationId);
+    const built = buildLayerByName(pick.room, root, file, {
       runId: (toolCtx && toolCtx.runId) || "",
-      index: room.lessonFiles.length,
+      index: pick.room.lessonFiles.length,
       transitionHint: typeof args.transitionHint === "string" ? args.transitionHint : "",
     });
     if (!built.ok) return built.reason;
     const { layer, parsed } = built;
 
+    // 剧本确实读出来了才真正改挂（读失败就别留下"房间换了 key"的副作用）
+    const adopted = Boolean(pick.adoptInto);
+    const previousId = pick.room.conversationId;
+    const room = adopted ? rooms.renameRoom(pick.room, pick.adoptInto) : pick.room;
+    if (adopted) ctxRef.log(`课堂改挂：把正在看的教室（${previousId}）认作 ${pick.adoptInto} 的教室`);
+
     const mode = args.interrupt === "append" ? "append" : "interrupt";
     const { frameCount, dropped } = rooms.pushLayer(room, layer, mode);
-    deliverLayer(room, layer, conversationId, { mode, dropped });
+    deliverLayer(room, layer, conversationId, { mode, dropped, adopted });
+    schedulePersist();
 
     const warnNote = parsed.warnings.length
       ? `\n有 ${parsed.warnings.length} 处问题（前 2 条）：\n` +
@@ -507,7 +725,9 @@ function registerIpcHandlers(ctx) {
     const conversationId = (payload && payload.conversationId) || boundConversationId;
     const room = rooms.getRoom(conversationId);
     if (!room) return { ok: false, reason: "当前会话还没有课堂，先让昔涟推送一份剧本吧。" };
-    return Object.assign({ ok: true }, rooms.advance(room));
+    const result = rooms.advance(room);
+    schedulePersist(); // 每点一帧都记一下 cursor —— 去抖 1.2s，不会每点都写盘（§13）
+    return Object.assign({ ok: true }, result);
   });
 
   // 列出可回放的剧本（§14）。窗口的剧本下拉与设置面板都走这条。
@@ -533,11 +753,11 @@ function registerIpcHandlers(ctx) {
     const { frameCount } = rooms.replayLayer(room, built.layer);
     boundConversationId = conversationId;
     sendToWindow(CH("bind"), { conversationId });
+    schedulePersist();
     return {
       ok: true,
       mode: "section",
       files: [built.layer.file],
-      fallback: built.layer.fallback === true,
       frames: frameCount,
       boardText: board.boardText(room.board),
       warnings: built.parsed.warnings.length,
@@ -566,12 +786,12 @@ function registerIpcHandlers(ctx) {
     const { frameCount } = rooms.replayAll(room, layers);
     boundConversationId = conversationId;
     sendToWindow(CH("bind"), { conversationId });
+    schedulePersist();
     return {
       ok: true,
       mode: "course",
       files: layers.map((item) => item.file),
       skipped,
-      fallback: layers[0].fallback === true,
       frames: frameCount,
       boardText: board.boardText(room.board),
     };
@@ -611,12 +831,12 @@ function registerIpcHandlers(ctx) {
 
     boundConversationId = conversationId;
     sendToWindow(CH("bind"), { conversationId });
+    schedulePersist();
     return {
       ok: true,
       mode: single ? "section" : "course",
       files: layers.map((item) => item.file),
       skipped,
-      fallback: layers[0].fallback === true,
       frames: frameCount,
       boardText: board.boardText(room.board),
     };
@@ -638,20 +858,17 @@ function registerIpcHandlers(ctx) {
   });
 }
 
-// ---------------------------------------------------------------- 兜底稽核（§6.3）
+// ---------------------------------------------------------------- 轮次稽核（§6.3）
 
 /**
- * 轮次稽核：本轮成功结束、课堂正开着且有内容在播，却没有任何成功的推送。
+ * 轮次稽核：本轮成功结束、课堂正开着且有内容在播，模型却**写了剧本没推** ——
+ * 直接把这个文件推出去。不需要模型，结果最确定。
  *
- * 两种漏法分开处理：
- *   a) 写了剧本文件但忘了推 → 直接把那个文件推出去。不需要模型，结果最确定。
- *   b) 对课堂一个工具都没调过 → 用 Provider 阶段留存的插话原文补一段最小剧本。
- *
- * 若模型调过课堂的其它工具（status / lesson_list / close、或失败的 write_lesson），
- * 说明它是有意识地不动课堂（比如在回答另一个问题），**不补** —— 乱补比不补更烦人。
+ * 只稽核这一种漏法。模型这轮压根没碰课堂（什么剧本都没写），说明它是有意不接，
+ * 插件**不替它补一段** —— 要不要上课由模型自己决定（§6.2）。乱补比不补更烦人。
  */
 async function auditTurn(conversationId, entry) {
-  if (!conversationId) return;
+  if (!conversationId || !entry.wroteFile) return;
   const room = rooms.getRoom(conversationId);
   // 课堂没开、或队列空着（还没讲 / 已经讲完）：沉默是正常的，不用补
   if (!room || !room.frames.length) return;
@@ -662,98 +879,24 @@ async function auditTurn(conversationId, entry) {
   const root = await workspaceRootOf(null, conversationId);
   if (!root) return;
 
-  //（a）写了没推：直接补推。这一层是模型自己的内容，不标 fallback。
-  if (entry.wroteFile) {
-    const built = buildLayerByName(room, root, entry.wroteFile, { index: room.lessonFiles.length });
-    if (!built.ok) {
-      ctxRef.log(`轮次稽核：模型写了《${entry.wroteFile}》却没推，补推失败：${built.reason}`);
-      return;
-    }
-    const { dropped } = rooms.pushLayer(room, built.layer, "interrupt");
-    deliverLayer(room, built.layer, conversationId, {
-      mode: "interrupt",
-      dropped,
-      notice: { kind: "fallback", text: `剧本《${entry.wroteFile}》写了但没推，已替你推出去。` },
-    });
-    ctxRef.log(`轮次稽核：补推了模型写了却没推的《${entry.wroteFile}》`);
-    return;
-  }
-
-  if (entry.classroomToolUsed) return; // 有意识地没动课堂
-  await fallbackScript(conversationId, room);
-}
-
-/**
- * 兜底补剧（§6.3b）：模型这轮对课堂毫无动作，用最小的一次额外调用补一段。
- *
- * 复用与模型完全相同的写盘 + 推送路径，所以它在 `learn/lessons/` 里留得下、回放里也演得出，
- * 与模型产的剧本没有任何区别 —— 不会变成一段只能看一次、无法重演的内容。
- */
-async function fallbackScript(conversationId, room) {
-  const llm = ctxRef && ctxRef.deps && ctxRef.deps.llm;
-  const userText = String(room.lastUserText || "").trim();
-  if (!llm || !userText) return;
-
-  const last = fallbackAt.get(conversationId) || 0;
-  if (Date.now() - last < FALLBACK_COOLDOWN_MS) return;
-  fallbackAt.set(conversationId, Date.now()); // 先记时间，避免并发的第二次调用重复补
-
-  const root = await workspaceRootOf(null, conversationId);
-  if (!root) return;
-
-  let text;
-  try {
-    const request = buildFallbackRequest({ userText });
-    text = await llm.generateText(request.messages, request.options);
-  } catch (err) {
-    ctxRef.log(`兜底补剧：模型调用失败（${err && err.message ? err.message : err}）`);
-    return;
-  }
-
-  const script = sanitizeGeneratedScript(text);
-  const file = `补充-${Date.now()}.bls`; // 名字唯一，且落在 §4.6 的白名单内
-  try {
-    lessons.writeLesson(root, file, script);
-  } catch (err) {
-    ctxRef.log(`兜底补剧：写盘失败（${err && err.message ? err.message : err}）`);
-    return;
-  }
-
-  const built = buildLayerFromSource(conversationId, file, script, {
-    fallback: true,
-    index: room.lessonFiles.length,
-  });
+  const built = buildLayerByName(room, root, entry.wroteFile, { index: room.lessonFiles.length });
   if (!built.ok) {
-    // 与 write_lesson 同一个原则：残次品不留在 learn/lessons/ 里
-    lessons.deleteLesson(root, file);
-    ctxRef.log(`兜底补剧：生成的内容不是合法剧本，已删除 ${file}。${built.reason}`);
+    ctxRef.log(`轮次稽核：模型写了《${entry.wroteFile}》却没推，补推失败：${built.reason}`);
     return;
   }
-
   const { dropped } = rooms.pushLayer(room, built.layer, "interrupt");
   deliverLayer(room, built.layer, conversationId, {
     mode: "interrupt",
     dropped,
-    notice: { kind: "fallback", text: "模型这轮没接上课堂，昔涟临时补了一小段。" },
+    notice: { kind: "auto-push", text: `剧本《${entry.wroteFile}》写了但没推，已替你推出去。` },
   });
-  ctxRef.log(`兜底补剧：已补《${file}》，${bls.summarizeSteps(built.parsed.steps)}`);
-}
-
-/** 模型爱把正文包在代码围栏里、或在前面加一句"好的，这是剧本："。都砍掉再解析。 */
-function sanitizeGeneratedScript(text) {
-  const lines = String(text == null ? "" : text)
-    .replace(/\r\n/g, "\n")
-    .trim()
-    .split("\n");
-  const start = lines.findIndex((line) => /^(meta|say|board)\b/.test(line.trim()));
-  const picked = start > 0 ? lines.slice(start) : lines.slice();
-  while (picked.length && /^```/.test(picked[picked.length - 1].trim())) picked.pop();
-  return picked.join("\n").trim();
+  schedulePersist();
+  ctxRef.log(`轮次稽核：补推了模型写了却没推的《${entry.wroteFile}》`);
 }
 
 // ---------------------------------------------------------------- 生命周期
 
-function register(ctx) {
+async function register(ctx) {
   ctxRef = ctx;
 
   ctx.registerTool(writeLessonTool);
@@ -762,7 +905,8 @@ function register(ctx) {
   ctx.registerTool(statusTool);
   ctx.registerTool(closeTool);
 
-  // §6.2：常驻格式说明；有活跃房间时追加课堂现场（板书全文 + 文件清单 + 强制调工具的硬约束）。
+  // §6.2：常驻格式说明；有活跃房间时追加课堂现场（板书全文 + 文件清单）。
+  // 只"告知"不"下令"：要不要动用课堂由模型自己决定，这里不做硬约束（§6.3 只兜"写了没推"）。
   ctx.registerPromptProvider({
     id: "classroom",
     modes: ["learn"],
@@ -771,7 +915,6 @@ function register(ctx) {
       if (signal && signal.aborted) return "";
       const room = rooms.getRoom(conversationId);
       if (!room) return BLS_FORMAT_SPEC;
-      room.lastUserText = String(userText || "");
 
       const head = room.frames[0];
       const progress =
@@ -791,8 +934,8 @@ function register(ctx) {
     },
   });
 
-  // §6.3 轮次稽核：模型漏调工具时用 lastUserText 兜底补一段最小剧本。
-  // 监听器里只做同步记账，兜底动作留到 turn:finished 异步跑（别占着宿主的发布路径）。
+  // §6.3 轮次稽核：模型写了剧本却没推时，替它推出去（只兜这一种）。
+  // 监听器里只做同步记账，补推动作留到 turn:finished 异步跑（别占着宿主的发布路径）。
   ctx.events.on("host:turn:started", (payload) => {
     const event = payload || {};
     if (event.source !== "desktop" || !event.runId) return;
@@ -805,9 +948,9 @@ function register(ctx) {
     const event = payload || {};
     if (!event.runId || !event.toolId) return;
     if (!String(event.toolId).startsWith(`${PLUGIN_ID}_`)) return;
+    // 见到本轮某个课堂工具的 tool:finished 也把账本建起来：即便错过了 turn:started，
+    // 也能靠它记下本轮是否成功推过（§6.3）
     const entry = auditEntry(event.runId);
-    // 调过课堂的任何一个工具都算"模型知道课堂存在"（失败也算——它试过了）
-    entry.classroomToolUsed = true;
     if (event.status === "success" && event.toolId === `${PLUGIN_ID}_push_script`) {
       entry.pushed = true;
     }
@@ -817,17 +960,18 @@ function register(ctx) {
     const event = payload || {};
     const entry = event.runId ? runs.get(event.runId) : null;
     if (event.runId) runs.delete(event.runId);
-    if (!entry) return; // 没看到这一轮的开头就不猜，免得误补
+    if (!entry) return; // 没看到这一轮的任何事件就不猜，免得误补
     if (event.source !== "desktop") return;
     if (event.status !== "success") return; // 取消 / 超时 / 运行错误都不补
     if (event.mode !== "learn" && entry.mode !== "learn") return;
     if (entry.pushed) return;
     auditTurn(entry.conversationId || event.conversationId || "", entry).catch((err) => {
-      ctx.log(`轮次稽核兜底失败：${err && err.message ? err.message : err}`);
+      ctx.log(`轮次稽核失败：${err && err.message ? err.message : err}`);
     });
   });
 
   ctx.onDispose(() => {
+    flushPersist();
     closeWindow();
     rooms.clearAll();
     clearAudit();
@@ -836,7 +980,15 @@ function register(ctx) {
   });
 
   registerIpcHandlers(ctx);
-  ctx.log("better-lessons 已注册：write_lesson / push_script / lesson_list / status / close（含轮次稽核与兜底补剧）");
+
+  // §13 持久化：把上次的课堂与窗口状态恢复回来。放在最后——存档坏了也不该影响插件本身可用。
+  try {
+    await restorePersisted();
+  } catch (err) {
+    ctx.log(`持久化恢复失败：${err && err.message ? err.message : err}`);
+  }
+
+  ctx.log("better-lessons 已注册：write_lesson / push_script / lesson_list / status / close（含「写了没推」的轮次稽核与持久化）");
 }
 
 async function open() {
@@ -844,6 +996,7 @@ async function open() {
 }
 
 function unregister() {
+  flushPersist();
   closeWindow();
   rooms.clearAll();
   clearAudit();
