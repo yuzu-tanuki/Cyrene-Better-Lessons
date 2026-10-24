@@ -19,7 +19,14 @@
  *   · 注册 IPC 走 ctx.registerIpc，插件停用时宿主自动摘除，不用手工维护监听表。
  */
 const path = require("node:path");
-const { BrowserWindow, dialog, screen } = require("electron");
+
+// electron 延迟加载：只在真正要开窗口 / 弹文件选择器时才取。
+// 顶层 require 会让"在空目录 require 入口文件"的自包含冒烟直接报 electron 缺失。
+let electronApiCache = null;
+function electronApi() {
+  if (!electronApiCache) electronApiCache = require("electron");
+  return electronApiCache;
+}
 
 const bls = require("./bls.cjs");
 const board = require("./board.cjs");
@@ -239,6 +246,7 @@ async function openWindow() {
     return pluginWin;
   }
 
+  const { BrowserWindow, screen } = electronApi();
   const { workArea } = screen.getPrimaryDisplay(); // 已排除任务栏
   const saved = prefs.windowBounds;
   // 默认左半屏；有存档就沿用，但要夹回当前工作区（换了分辨率 / 拔了显示器照样能用）
@@ -402,6 +410,7 @@ function pickLessonFiles(defaultPath) {
   };
   if (defaultPath) options.defaultPath = defaultPath;
 
+  const { dialog } = electronApi();
   const owner = pluginWin && !pluginWin.isDestroyed() ? pluginWin : null;
   const pending = owner ? dialog.showOpenDialog(owner, options) : dialog.showOpenDialog(options);
   return pending.then(
