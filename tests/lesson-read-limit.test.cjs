@@ -17,11 +17,11 @@ test("工作区读取与文件选择器读取都在读盘前检查文件类型�
   fs.writeFileSync(oversized, Buffer.alloc(MAX_BYTES + 1, 0x61));
   fs.mkdirSync(notFile);
 
-  const originalRead = fs.readFileSync;
+  const originalRead = fs.readSync;
   const reads = [];
-  fs.readFileSync = function (filePath, ...args) {
-    reads.push(filePath);
-    return originalRead.call(this, filePath, ...args);
+  fs.readSync = function (fd, ...args) {
+    reads.push(fd);
+    return originalRead.call(this, fd, ...args);
   };
   try {
     assert.throws(() => readLesson(root, "oversized.bls"), /剧本超过 65536 字节上限/);
@@ -32,16 +32,38 @@ test("工作区读取与文件选择器读取都在读盘前检查文件类型�
 
     assert.equal(readLesson(root, "valid.bls").length, MAX_BYTES);
     assert.equal(readLessonByPath(valid).length, MAX_BYTES);
-    assert.deepEqual(reads, [valid, valid]);
+    assert.ok(reads.length >= 2);
+    assert.ok(reads.every((fd) => Number.isInteger(fd)));
+    const validReads = reads.length;
     assert.throws(() => readLesson(root, "missing.bls"), { code: "ENOENT" });
-    assert.deepEqual(reads, [valid, valid]);
+    assert.equal(reads.length, validReads);
   } finally {
-    fs.readFileSync = originalRead;
+    fs.readSync = originalRead;
     fs.unlinkSync(valid);
     fs.unlinkSync(oversized);
     fs.rmdirSync(notFile);
     fs.rmdirSync(dir);
     fs.rmdirSync(path.join(root, "learn"));
+    fs.rmdirSync(root);
+  }
+});
+
+test("文件在大小检查后增长时，实际读取仍受字节上限约束", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "better-lessons-growing-read-"));
+  const target = path.join(root, "growing.bls");
+  const originalFstat = fs.fstatSync;
+  fs.writeFileSync(target, Buffer.alloc(MAX_BYTES + 1, 0x61));
+  try {
+    fs.fstatSync = function (fd, ...args) {
+      const stat = originalFstat.call(this, fd, ...args);
+      const stale = Object.create(stat);
+      Object.defineProperty(stale, "size", { value: 0n });
+      return stale;
+    };
+    assert.throws(() => readLessonByPath(target), /剧本超过 65536 字节上限/);
+  } finally {
+    fs.fstatSync = originalFstat;
+    fs.unlinkSync(target);
     fs.rmdirSync(root);
   }
 });
