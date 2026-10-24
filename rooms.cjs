@@ -81,7 +81,7 @@ function makeTransition(kind, text, title) {
   return { type: "transition", kind, text: text || "", title: title || "" };
 }
 
-/** 过渡文案：模型可给 hint，否则用默认话术。 */
+/** 返回上一层的过渡文案可由模型指定；进入新层时使用默认话术。 */
 function transitionText(kind, hint) {
   if (hint) return String(hint);
   return kind === "out" ? "好，我们回到刚才那里。" : "先看一个补充。";
@@ -134,7 +134,7 @@ function pushLayer(room, layer, mode, maxFrames) {
 
   if (interrupt && head && head.type === "layer") {
     // cursor 一直在 layer 对象上，不需要额外快照
-    room.frames.unshift(makeTransition("in", transitionText("in", layer.transitionHint)));
+    room.frames.unshift(makeTransition("in", transitionText("in", "")));
     room.frames.splice(1, 0, { type: "layer", layer });
   } else if (interrupt && head) {
     room.frames.splice(1, 0, { type: "layer", layer });
@@ -233,10 +233,10 @@ function advance(room) {
 
     const layer = head.layer;
     if (layer.cursor >= layer.steps.length) {
-      // 本层结束：弹出；还有后续层就补一个 transition(out) 让"回到刚才"有个交代
+      // 本层结束：弹出；还有后续层就用本层保留的 hint 生成 transition(out)
       room.frames.shift();
       if (room.frames.length) {
-        room.frames.unshift(makeTransition("out", transitionText("out", "")));
+        room.frames.unshift(makeTransition("out", transitionText("out", layer.transitionHint)));
       }
       continue;
     }

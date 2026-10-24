@@ -423,7 +423,6 @@ body.art-board .board-surface {
   text-align: left;
 }
 .board-surface hr { margin: 1em 0; border: none; border-top: 1px solid rgba(255, 255, 255, 0.16); }
-.board-surface a { color: var(--cy-pill-border); } /* 宿主的 pink-200，在墨绿板面上读得清 */
 
 /* 数学公式（KaTeX）：行内公式跟着正文走；$$...$$ 是块级元素，参与黑板滚动与行级动画标注。
    KaTeX 的输出不写死颜色，会继承板面的粉笔白。 */

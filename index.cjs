@@ -279,6 +279,12 @@ async function openWindow() {
     webPreferences: { nodeIntegration: true, contextIsolation: false },
   });
   pluginWin = win;
+  // 这个窗口拥有 Node 权限，只能显示打包的 ui.html。页面发起的跳转和新窗口请求一律拦截。
+  // loadFile 属于主进程主动加载，不会触发这些页面导航事件。
+  win.webContents.on("will-navigate", (event) => event.preventDefault());
+  win.webContents.on("will-frame-navigate", (event) => event.preventDefault());
+  win.webContents.on("will-redirect", (event) => event.preventDefault());
+  win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   if (saved && saved.maximized) win.maximize();
   // 拖动 / 缩放 / 关闭各记一次矩形（去抖），下次沿用
   const rememberBounds = () => {
@@ -547,19 +553,19 @@ const writeLessonTool = {
     const root = await workspaceRootOf(toolCtx, toolCtx && toolCtx.conversationId);
     if (!root) return "该会话未绑定工作区，无法写入剧本文件。请确认当前会话处于 learn 模式且已绑定工作区。";
     try {
-      const result = lessons.writeLesson(root, file, script);
-      // §5.3 第 6 条：写完立刻解析一遍；一个有效 step 都没有就删掉刚写的文件，
-      // 避免 learn/lessons/ 里堆积无法演出的残次品，并把问题行号回给模型让它自己修。
+      lessons.resolveLessonPath(root, file);
+      // §5.3 第 6 条：先解析再写盘。无有效 step 或超出解析上限时，
+      // 已有剧本（包括用户手工修改的内容）必须保持原样。
       let parsed;
       try {
         parsed = bls.parseBLS(script);
       } catch (err) {
-        lessons.deleteLesson(root, file);
         return (
-          `剧本写成后校验不通过，已删除 learn/lessons/${result.file}。请修正后重写。\n` +
+          `剧本校验不通过，未写入 learn/lessons/${file}。请修正后重写。\n` +
           `${err.message}`
         );
       }
+      const result = lessons.writeLesson(root, file, script);
       const warnNote = parsed.warnings.length
         ? `\n有 ${parsed.warnings.length} 处问题（前 2 条）：\n` +
           parsed.warnings.slice(0, 2).map((w) => `  第 ${w.line} 行：${w.message}`).join("\n")
@@ -663,6 +669,13 @@ const lessonListTool = {
   },
 };
 
+/** cursor 指向下一步；最后一步已展示但尚未弹栈时，本层应报告完成。 */
+function describeLayerProgress(layer, activePrefix = "") {
+  const total = layer.steps.length;
+  if (layer.cursor >= total) return `《${layer.file}》已完成 ${total}/${total} 步，等待点击切换`;
+  return `${activePrefix}《${layer.file}》第 ${layer.cursor + 1}/${total} 步`;
+}
+
 const statusTool = {
   id: "better-lessons_status",
   name: "查询课堂状态",
@@ -677,14 +690,12 @@ const statusTool = {
     const conversationId = (toolCtx && toolCtx.conversationId) || "default";
     const room = rooms.getRoom(conversationId);
     const layer = rooms.activeLayer(room);
-    const playing = layer
-      ? `《${layer.file}》第 ${layer.cursor + 1}/${layer.steps.length} 步`
-      : "（无）";
+    const playing = layer ? describeLayerProgress(layer) : "（无）";
     const text = room ? board.boardText(room.board) : "";
     const boardText = text.length > 2000 ? `${text.slice(0, 2000)}\n…（已截断）` : text || "（黑板为空）";
     return [
       `课堂窗口：${pluginWin && !pluginWin.isDestroyed() ? "已打开" : "未打开"}（绑定会话 ${boundConversationId || "无"}）`,
-      `正在播放：${playing}`,
+      `${layer && layer.cursor >= layer.steps.length ? "本层进度" : "正在播放"}：${playing}`,
       `板书：\n${boardText}`,
     ].join("\n");
   },
@@ -928,7 +939,7 @@ async function register(ctx) {
       const head = room.frames[0];
       const progress =
         head && head.type === "layer"
-          ? `正在播放《${head.layer.file}》第 ${head.layer.cursor + 1}/${head.layer.steps.length} 步`
+          ? describeLayerProgress(head.layer, "正在播放")
           : head
             ? `即将播放一层过渡（${head.kind === "in" ? "进入新推的内容" : "回到被打断的那层"}）`
             : "当前没有正在播放的剧本";

@@ -153,9 +153,14 @@
       breaks: false,
       typographer: false,
     });
+    // BLS 可以保留 [文字](地址) 的写法，但课堂只显示链接文字。
+    // 不生成 <a>，连拖到桌面创建快捷方式的入口也一并移除。
+    md.renderer.rules.link_open = () => "";
+    md.renderer.rules.link_close = () => "";
+    // 图片写法也只显示替代文字，不生成可能发起远程请求的 <img>。
+    md.renderer.rules.image = (tokens, idx) => md.utils.escapeHtml(tokens[idx].content);
 
-    // 白名单必须覆盖 markdown-it 会产出的全部标签，否则内容会被静默剥掉。
-    // 刻意排除 img：板书不需要图片，而放行等于让模型写的内容去发远程请求（这个窗口开着 nodeIntegration）。
+    // 白名单覆盖需要展示的标签；a / img 刻意禁用，渲染规则在此之前已把它们转成文字。
     // 注意删除线是 <s>（markdown-it 的默认渲染），不是 <del>。
     //
     // ALLOW_DATA_ATTR 为 true 是**必要**的：行区间标注（data-line，见 installLineTagging）
@@ -165,9 +170,9 @@
       ALLOWED_TAGS: [
         "p", "br", "hr", "strong", "em", "del", "s", "code", "pre", "blockquote",
         "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6",
-        "table", "thead", "tbody", "tr", "th", "td", "a", "span",
+        "table", "thead", "tbody", "tr", "th", "td", "span",
       ],
-      ALLOWED_ATTR: ["href", "title", "class"],
+      ALLOWED_ATTR: ["title", "class"],
       ALLOW_DATA_ATTR: true,
     };
 
@@ -1020,7 +1025,7 @@
     btnReplayAll.addEventListener("click", () => requestReplay("replay-all", {}));
 
     stage.addEventListener("click", (event) => {
-      if (event.target.closest(".titlebar") || event.target.closest("a")) return;
+      if (event.target.closest(".titlebar")) return;
       // 正在选文本、或刚拖过滚动条时不要顺手把课推进一格
       const selection = window.getSelection();
       if (selection && !selection.isCollapsed) return;
