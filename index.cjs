@@ -43,7 +43,13 @@ const { BLS_FORMAT_SPEC, SAMPLE_SCRIPT, buildClassroomBrief } = prompts;
 /** 每个会话一个 Room 由 rooms 管理；窗口只有一个，绑定到最近一次推送的会话（§11.1）。 */
 let pluginWin = null;
 let boundConversationId = null;
+let bindingVersion = 0;
 let ctxRef = null;
+
+function setBoundConversationId(nextId) {
+  if (boundConversationId !== nextId) bindingVersion += 1;
+  boundConversationId = nextId;
+}
 
 /**
  * 从插件列表直接打开窗口、且此前没有任何剧本被推过时，课堂用的房间 key。
@@ -173,7 +179,7 @@ async function restorePersisted() {
   const storage = ctxRef && ctxRef.storage;
   if (!storage) return;
   loadPrefs();
-  if (prefs.boundConversationId) boundConversationId = prefs.boundConversationId;
+  if (prefs.boundConversationId) setBoundConversationId(prefs.boundConversationId);
 
   const snapshot = storage.get(STORAGE_ROOMS);
   if (!snapshot || typeof snapshot !== "object") return;
@@ -276,10 +282,15 @@ async function openWindow() {
     // 否则圆角外那四个角会露出方块。
     backgroundColor: "#00000000",
     transparent: true,
-    webPreferences: { nodeIntegration: true, contextIsolation: false },
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      preload: path.join(__dirname, "preload.cjs"),
+    },
   });
   pluginWin = win;
-  // 这个窗口拥有 Node 权限，只能显示打包的 ui.html。页面发起的跳转和新窗口请求一律拦截。
+  // 页面无 Node 权限，IPC 只经隔离的 preload 白名单。页面发起的跳转和新窗口请求一律拦截。
   // loadFile 属于主进程主动加载，不会触发这些页面导航事件。
   win.webContents.on("will-navigate", (event) => event.preventDefault());
   win.webContents.on("will-frame-navigate", (event) => event.preventDefault());
@@ -330,7 +341,7 @@ function deliverLayer(room, layer, conversationId, options) {
   // 窗口只有一个，绑定到最近一次推送的会话（§11.1）。跨会话推送时先让窗口切绑定、
   // 并把那个房间已有的现场还原回去，否则窗口会一边演新房间的步、一边留着上个房间的板书。
   const switching = Boolean(boundConversationId) && boundConversationId !== conversationId;
-  boundConversationId = conversationId;
+  setBoundConversationId(conversationId);
   schedulePersist(); // 绑定换了，下次启动要能回到同一个房间（§13）
 
   const deliver = () => {
@@ -750,6 +761,28 @@ function registerIpcHandlers(ctx) {
     return Object.assign({ ok: true }, result);
   });
 
+  // 回看只读当前屏幕所处 BLS 已展示的 say；打开抽屉不改变播放状态。
+  ctx.registerIpc("review", (payload) => {
+    const conversationId = (payload && payload.conversationId) || boundConversationId || LOCAL_ROOM_ID;
+    const room = rooms.getRoom(conversationId);
+    return {
+      ok: true,
+      file: room ? room.review.file : "",
+      says: room ? room.review.says.slice() : [],
+    };
+  });
+
+  // 只清当前窗口绑定的课堂；空房间也视为已清空。剧本文件仍留在磁盘上。
+  ctx.registerIpc("clear-classroom", (payload) => {
+    const conversationId = (payload && payload.conversationId) || boundConversationId || LOCAL_ROOM_ID;
+    const room = rooms.getRoom(conversationId);
+    if (room) {
+      rooms.clearRoom(room);
+      schedulePersist();
+    }
+    return { ok: true, boardText: "" };
+  });
+
   // 列出可回放的剧本（§14）。窗口的剧本下拉与设置面板都走这条。
   ctx.registerIpc("lessons", async (payload) => {
     const conversationId = (payload && payload.conversationId) || boundConversationId;
@@ -763,15 +796,20 @@ function registerIpcHandlers(ctx) {
   ctx.registerIpc("replay", async (payload) => {
     const conversationId = (payload && payload.conversationId) || boundConversationId || LOCAL_ROOM_ID;
     const file = payload && payload.file;
-    const root = await workspaceRootOf(null, conversationId);
     const room = rooms.ensureRoom(conversationId);
+    const clearEpoch = room.clearEpoch;
+    const startedAtBinding = bindingVersion;
+    const root = await workspaceRootOf(null, conversationId);
+    if (room.clearEpoch !== clearEpoch || bindingVersion !== startedAtBinding) {
+      return { ok: false, canceled: true };
+    }
 
     // 不预先拦 root 为空的情况：挑来的剧本走 lessonPaths，本来就不需要工作区（§14g）
     const built = buildLayerByName(room, root, file, {});
     if (!built.ok) return { ok: false, reason: built.reason };
 
     const { frameCount } = rooms.replayLayer(room, built.layer);
-    boundConversationId = conversationId;
+    setBoundConversationId(conversationId);
     sendToWindow(CH("bind"), { conversationId });
     schedulePersist();
     return {
@@ -787,8 +825,13 @@ function registerIpcHandlers(ctx) {
   // 从头重放整节课（§14b）。播放列表沿用 room.lessonFiles 的顺序，读不出来的那节跳过。
   ctx.registerIpc("replay-all", async (payload) => {
     const conversationId = (payload && payload.conversationId) || boundConversationId || LOCAL_ROOM_ID;
-    const root = await workspaceRootOf(null, conversationId);
     const room = rooms.ensureRoom(conversationId);
+    const clearEpoch = room.clearEpoch;
+    const startedAtBinding = bindingVersion;
+    const root = await workspaceRootOf(null, conversationId);
+    if (room.clearEpoch !== clearEpoch || bindingVersion !== startedAtBinding) {
+      return { ok: false, canceled: true };
+    }
     const playlist = room.lessonFiles.slice();
     if (!playlist.length) return { ok: false, reason: "这节课还没有可回放的剧本。" };
 
@@ -804,7 +847,7 @@ function registerIpcHandlers(ctx) {
     }
 
     const { frameCount } = rooms.replayAll(room, layers);
-    boundConversationId = conversationId;
+    setBoundConversationId(conversationId);
     sendToWindow(CH("bind"), { conversationId });
     schedulePersist();
     return {
@@ -823,8 +866,13 @@ function registerIpcHandlers(ctx) {
   ctx.registerIpc("pick-lesson", async (payload) => {
     const conversationId = (payload && payload.conversationId) || boundConversationId || LOCAL_ROOM_ID;
     const room = rooms.ensureRoom(conversationId);
+    const clearEpoch = room.clearEpoch;
+    const startedAtBinding = bindingVersion;
 
     const picked = await pickLessonFiles(await defaultLessonDir(conversationId));
+    if (room.clearEpoch !== clearEpoch || bindingVersion !== startedAtBinding) {
+      return { ok: false, canceled: true };
+    }
     if (!picked.ok) return picked;
 
     const layers = [];
@@ -849,7 +897,7 @@ function registerIpcHandlers(ctx) {
       ? rooms.replayLayer(room, layers[0])
       : rooms.replayAll(room, layers);
 
-    boundConversationId = conversationId;
+    setBoundConversationId(conversationId);
     sendToWindow(CH("bind"), { conversationId });
     schedulePersist();
     return {
@@ -995,7 +1043,7 @@ async function register(ctx) {
     closeWindow();
     rooms.clearAll();
     clearAudit();
-    boundConversationId = null;
+    setBoundConversationId(null);
     ctxRef = null;
   });
 
@@ -1020,7 +1068,7 @@ function unregister() {
   closeWindow();
   rooms.clearAll();
   clearAudit();
-  boundConversationId = null;
+  setBoundConversationId(null);
   ctxRef = null;
 }
 

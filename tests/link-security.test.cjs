@@ -9,9 +9,10 @@ const vm = require("node:vm");
 test("课堂窗口拒绝页面导航和新窗口，也不注册外部打开链接的 IPC", async () => {
   let win;
   class BrowserWindow extends EventEmitter {
-    constructor() {
+    constructor(options) {
       super();
       win = this;
+      this.options = options;
       this.webContents = new EventEmitter();
       this.webContents.setWindowOpenHandler = (handler) => { this.windowOpenHandler = handler; };
       this.webContents.send = () => {};
@@ -49,6 +50,11 @@ test("课堂窗口拒绝页面导航和新窗口，也不注册外部打开链�
       log() {},
     });
     await plugin.open();
+
+    assert.equal(win.options.webPreferences.nodeIntegration, false);
+    assert.equal(win.options.webPreferences.contextIsolation, true);
+    assert.equal(win.options.webPreferences.sandbox, true);
+    assert.equal(win.options.webPreferences.preload, path.join(__dirname, "..", "preload.cjs"));
 
     for (const name of ["will-navigate", "will-frame-navigate", "will-redirect"]) {
       let prevented = false;

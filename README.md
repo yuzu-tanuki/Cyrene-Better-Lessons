@@ -12,14 +12,14 @@
 
 ## 简介
 
-**better-lessons** 是 Cyrene 的一个插件。在 learn 模式下，昔涟可以把要说的话写成一份**剧本（BLS）**，然后在一间独立的 视觉小说风格教室窗口里演出：教室背景、黑板、立绘与底部对话框，由**鼠标点击逐帧推进**。
+**better-lessons** 是 Cyrene 的一个插件。在 learn 模式下，昔涟可以把要说的话写成一份**剧本（BLS）**，然后在一间独立的 视觉小说风格教室窗口里演出：教室背景、黑板、立绘与底部对话框，由**鼠标左键、空格或回车逐帧推进**。
 
 剧本以纯文本文件的形式落在工作区的 `learn/lessons/` 下，因此课程可以被重放、被手工修改、被继续续写——文件就是唯一真相源。
 
 ## 特性
 
 - **BLS 剧本文本格式**：全篇只有 `meta` / `say` / `board` 四个关键字，板书正文就是 markdown，写错了不会阻塞整堂课。
-- **点击推进**：一次点击推进一个 step，节奏完全掌握在用户手里。
+- **逐帧推进**：鼠标左键点击舞台，或按空格、回车，一次推进一个 step，节奏完全掌握在用户手里。
 - **课堂插话**：直接在下方的聊天框里提问，昔涟可以写出新的一层剧本、打断当前播放、演完后**回到刚才那一步继续讲**，板书按断点瞬时重绘。
 - **回放**：剧本留在 `learn/lessons/`，可以「重放本节」或「从头」重演整节课，全程不触发大模型。
 - **公式与代码**：板书支持标准 markdown 与 LaTeX（`$...$` / `$$...$$`），行级动画与自动滚动跟随新内容。
@@ -37,13 +37,15 @@
 
 4. 昔涟会调用 `better-lessons_write_lesson` 写剧本、再用 `better-lessons_push_script` 推送，教室窗口自动打开。若窗口没开，也可以从插件列表的「打开」按钮进入，再用标题栏的 `📂 打开剧本` 自己挑一个 `.bls` 文件。
 
-窗口默认占**左半屏**，右半边留给你放别的东西（例如 learn 模式写在 `notes/` 里的笔记）。标题栏右侧的三个控件：
+窗口默认占**左半屏**，右半边留给你放别的东西（例如 learn 模式写在 `notes/` 里的笔记）。标题栏的控件：
 
 | 控件 | 作用 |
 |---|---|
 | `📂 打开剧本` | 用系统文件选择器挑剧本；单选 = 重放本节，多选 = 按文件名顺序当作一整节课 |
 | `⟲ 本节` | 重放当前这一层 |
 | `⟲ 从头` | 按播放列表顺序重演整节课 |
+| `× 清空` | 清掉当前与待播剧本、板书和播放列表，回到开场状态；磁盘上的剧本文件保留 |
+| \|◀ 回放 | 从左侧拉出回看抽屉，只看当前 BLS 已展示的对白；点击右侧空白处收起，不推进剧情 |
 
 ## BLS 速览
 
@@ -99,6 +101,7 @@ board clear
 better-lessons/
 ├── manifest.json        # 插件清单：id better-lessons，version 0.1.0
 ├── index.cjs            # register / unregister / open：工具、Provider、事件、IPC、持久化
+├── preload.cjs          # 隔离的课堂 IPC 白名单
 ├── prompts.cjs          # 全部给模型的措辞
 ├── bls.cjs              # BLS 解析器 + 校验器：文本 → IR + warnings
 ├── lessons.cjs          # learn/lessons/ 文件 IO：路径白名单、读写、列举
@@ -120,7 +123,7 @@ better-lessons/
 |---|---|---|
 | [markdown-it](https://github.com/markdown-it/markdown-it) | 板书与对白的 markdown 渲染 | MIT |
 | [KaTeX](https://github.com/KaTeX/KaTeX) | LaTeX 公式渲染 | MIT |
-| [DOMPurify](https://github.com/cure53/DOMPurify) | HTML 净化（窗口开启了 `nodeIntegration`，这一步是必须的） | Apache-2.0 / MPL-2.0 |
+| [DOMPurify](https://github.com/cure53/DOMPurify) | HTML 净化（隔离渲染器仍须防止模型文本注入页面） | Apache-2.0 / MPL-2.0 |
 
 ## 许可证
 
